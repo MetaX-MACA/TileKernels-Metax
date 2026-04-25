@@ -12,6 +12,8 @@ from tile_kernels.utils import align, ceil_div
 
 def get_best_vectorize_size(dtype: T.dtype) -> int:
     target = determine_target(return_object=True)
+    if str(target.kind) == "maca":
+        return 32 // dtype.bytes
     ver = nvcc.get_target_compute_version(target)  # e.g. "8.6"
     major, _ = nvcc.parse_compute_version(ver)
     return (16 if major < 10 else 32) // dtype.bytes

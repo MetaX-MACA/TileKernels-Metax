@@ -86,7 +86,7 @@ def _mhc_pre_norm_fn_fwd_mul(
             sqrsum_part = T.alloc_fragment((token_block, 4), T.float32)
             T.clear(out_frag)
             T.clear(sqrsum_part)
-            for pz in T.Pipelined(rms_group_size // hidden_block, num_stages=2):
+            for pz in T.Pipelined(rms_group_size // hidden_block, num_stages=1):
                 x_smem_16 = T.alloc_shared((token_block, hidden_block), T.bfloat16)
                 fn_smem = T.alloc_shared((32, hidden_block), T.float32)
 
@@ -132,7 +132,7 @@ def _mhc_pre_norm_fn_fwd_norm(
     n_splits: int,
 ) -> tilelang.JITKernel:
     num_tokens = T.dynamic('num_tokens')
-    n_thr = 32
+    n_thr = 64
 
     @T.prim_func
     def _mhc_pre_norm_fn_fwd_norm_kernel(
@@ -211,7 +211,7 @@ def _mhc_pre_norm_fn_bwd_mul(
     n_rms_group: int,
     rms_group_size: int,
     token_block: int = 128,
-    hidden_block: int = 128,
+    hidden_block: int = 64,
 ) -> tilelang.JITKernel:
     assert mhc_mult3 <= 32
     num_tokens = T.dynamic('num_tokens')

@@ -39,8 +39,8 @@ def get_per_channel_cast_fused_kernel(
     if in_config.with_sf:
         TILE_K = 256
 
-    # Set num_threads_per_token = 32 to avoid bank conflict
-    num_threads_per_token = 32
+    # Set num_threads_per_token = 64 to avoid bank conflict
+    num_threads_per_token = 64
     assert TILE_K % num_threads_per_token == 0
 
     # Each thread processes a block of size VEC_M * VEC_K

@@ -144,7 +144,7 @@ def get_get_fused_mapping_kernel(
             for i in T.serial(start + lane_idx, aligned_end, warp_size):
                 T.assume(0 <= i)
                 expert_idx = T.Select(i < numel, T.int32(topk_idx_1d[i]), -1)
-                mask = T.call_extern(T.uint32, '__match_any_sync', 0xFFFFFFFF, expert_idx)
+                mask = T.call_extern(T.uint32, '__match_any_sync', tilelang.tvm.tir.const(0xFFFFFFFF, T.uint32), expert_idx)
                 count = T.popcount(mask & lane_mask)
 
                 if i < numel and expert_idx >= 0:

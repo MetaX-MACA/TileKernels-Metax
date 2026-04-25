@@ -39,7 +39,6 @@ def _mhc_post_fwd(mhc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024) ->
             c_local = T.alloc_fragment(mhc, T.float32)
             T.copy(a[pid_n, 0, 0], a_local)
             T.copy(c[pid_n, 0], c_local)
-            T.pdl_sync()
 
             for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=2):
                 T.copy(b[pid_n, 0, i0_h * h_blk], b_shared, disable_tma=True)

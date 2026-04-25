@@ -17,7 +17,7 @@ def assert_equal(x: torch.Tensor, y: torch.Tensor,
     # Hints: The tensor with a size of [32768, 1] and a stride of [1, 32768] is considered contiguous,
     # but using .view will cause an error. Therefore, .flatten is used to ensure the stride of the last dimension is 1.
     mask = x != y
-    assert torch.equal(x.contiguous().flatten().view(torch.uint8), y.contiguous().flatten().view(torch.uint8)), \
+    assert torch.equal(x.contiguous().flatten(), y.contiguous().flatten()), \
         f'Tensor values are not equal: {x.shape=} vs {y.shape=}\n' \
         f'mask={torch.nonzero(mask)}\n' \
         f'{x[mask]}\nvs\n{y[mask]}' \
