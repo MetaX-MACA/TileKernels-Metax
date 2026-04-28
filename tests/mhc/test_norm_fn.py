@@ -77,7 +77,7 @@ def test_correctness(
     residual_tl_grad = residual_tl.untyped_storage().grad_from_mhc_post = torch.zeros_like(residual_tl)
     torch.autograd.backward([out_tl], [test_data['out_grad']])
 
-    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = False
     out_ref = mhc_pre_norm_fn_ref(
         residual_ref,
         fn_ref,
