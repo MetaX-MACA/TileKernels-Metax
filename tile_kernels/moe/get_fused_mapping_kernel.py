@@ -11,7 +11,7 @@ from tile_kernels.utils import align
 
 @T.macro
 def divide_task(length: int, num_tasks: int, task_id: int, start: T.Ref, end: T.Ref):
-    length_per_task = align(T.ceildiv(length, num_tasks), 32)
+    length_per_task = align(T.ceildiv(length, num_tasks), 64)
     start = task_id * length_per_task
     end = T.min(start + length_per_task, length)
 
@@ -33,7 +33,7 @@ def get_get_fused_mapping_kernel(
     while num_threads < num_experts:
         num_threads *= 2
     assert num_threads <= 1024 and num_threads >= num_experts
-    warp_size = 32
+    warp_size = 64
     num_warps = num_threads // warp_size
 
     num_global_warps = num_sms * num_warps
