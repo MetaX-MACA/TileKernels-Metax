@@ -38,11 +38,11 @@ def _mhc_pre_big_fuse(
         comb_mix: T.Tensor[(num_tokens, mhc_mult * mhc_mult), T.float32],
         layer_input: T.Tensor[(num_tokens, hidden_size), T.bfloat16],
     ) -> None:
-        with T.Kernel(num_tokens, threads=96) as pid:
+        with T.Kernel(num_tokens, threads=128) as pid:
             ##################################################################
             # _mhc_pre_norm_fn_fwd_norm
             mixes_shared = T.alloc_shared(mhc_mult3, T.float32)
-            if T.get_thread_binding() < 32:
+            if T.get_thread_binding() < 64:
                 rms = T.alloc_fragment(1, T.float32)
                 mixes = T.alloc_fragment(mhc_mult3, T.float32)
                 T.clear(mixes)
@@ -57,7 +57,7 @@ def _mhc_pre_big_fuse(
                     mixes[j] *= rms[0]
                 T.copy(mixes, mixes_shared, disable_tma=True)
 
-            if T.get_thread_binding() < 32:
+            if T.get_thread_binding() < 64:
                 ##################################################################
                 # _mhc_pre_split_mixes_fwd (post & comb)
                 cm = T.alloc_fragment((mhc_mult, mhc_mult), T.float32)
