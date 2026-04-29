@@ -24,7 +24,7 @@ def get_swiglu_forward_and_per_token_cast_kernel(
     num_sms: Optional[int],
 ):
     num_elems_per_block = 4096
-    num_threads = 512 if with_pos_to_expert is True else 256
+    num_threads = 512 if with_pos_to_expert else 256
     _, num_per_channels = out_config.sf_block
 
     TILE_X = 1
