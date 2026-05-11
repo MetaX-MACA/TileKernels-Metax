@@ -11,7 +11,7 @@ from tile_kernels.utils import align
 
 @T.macro
 def divide_task(length: int, num_tasks: int, task_id: int, start: T.Ref, end: T.Ref):
-    length_per_task = align(T.ceildiv(length, num_tasks), 64)
+    length_per_task = align(T.ceildiv(length, num_tasks), 32)
     start = task_id * length_per_task
     end = T.min(start + length_per_task, length)
 
@@ -33,7 +33,7 @@ def get_get_fused_mapping_kernel(
     while num_threads < num_experts:
         num_threads *= 2
     assert num_threads <= 1024 and num_threads >= num_experts
-    warp_size = 64
+    warp_size = 32
     num_warps = num_threads // warp_size
 
     num_global_warps = num_sms * num_warps
@@ -141,12 +141,12 @@ def get_get_fused_mapping_kernel(
 
             divide_task(numel, num_global_warps, global_warp_idx, start, end)
             aligned_end = align(end, warp_size)
-            lane_mask = T.uint64(1 << lane_idx) + T.uint64(1 << lane_idx) - 1
+            lane_mask = T.uint32(1 << lane_idx) + T.uint32(1 << lane_idx) - 1
             lane_mask_rev = ~lane_mask
             for i in T.serial(start + lane_idx, aligned_end, warp_size):
                 T.assume(0 <= i)
                 expert_idx = T.Select(i < numel, T.int32(topk_idx_1d[i]), -1)
-                mask = T.call_extern(T.uint64, '__match_any_sync', tilelang.tvm.tir.const(0xFFFFFFFFFFFFFFFF, T.uint64), expert_idx)
+                mask = T.call_extern(T.uint32, '__match_any_sync', tilelang.tvm.tir.const(0xFFFFFFFF, T.uint32), expert_idx)
                 count = T.popcount(mask & lane_mask)
 
                 if i < numel and expert_idx >= 0:

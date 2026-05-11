@@ -18,7 +18,7 @@ def get_swiglu_backward_and_per_token_cast_kernel(
     out_config: CastOutputConfig,
     use_clamp: bool,
 ):
-    num_threads = 64
+    num_threads = 256
     align_length = 512
     hidden_aligned = align(hidden, align_length)
     _, num_per_channels = out_config.sf_block
