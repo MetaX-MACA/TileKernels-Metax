@@ -12,3 +12,10 @@ def test_build_inventory_groups_nested_tests(tmp_path: Path):
 
     assert inventory["total"] == 1
     assert inventory["groups"]["moe"]["files"] == ["tests/moe/test_gate.py"]
+
+
+def test_build_inventory_handles_missing_tests_dir(tmp_path: Path):
+    inventory = build_inventory(tmp_path)
+
+    assert inventory["total"] == 0
+    assert inventory["groups"] == {}

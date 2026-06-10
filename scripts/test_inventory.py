@@ -11,9 +11,13 @@ from pathlib import Path
 
 def build_inventory(root: Path) -> dict[str, object]:
     groups: dict[str, list[str]] = defaultdict(list)
-    for path in sorted((root / "tests").rglob("test_*.py")):
+    tests_dir = root / "tests"
+    if not tests_dir.is_dir():
+        return {"total": 0, "groups": {}}
+
+    for path in sorted(tests_dir.rglob("test_*.py")):
         rel = path.relative_to(root).as_posix()
-        parts = path.relative_to(root / "tests").parts
+        parts = path.relative_to(tests_dir).parts
         group = parts[0] if len(parts) > 1 else "root"
         groups[group].append(rel)
     return {
