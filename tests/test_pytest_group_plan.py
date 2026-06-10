@@ -17,6 +17,13 @@ class PytestGroupPlanTest(unittest.TestCase):
         self.assertEqual(report["groups"][0]["name"], "quant")
         self.assertIn("pytest tests/quant/test_cast.py", report["groups"][0]["command"])
 
+    def test_handles_missing_tests_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report = plan(Path(tmpdir))
+
+        self.assertEqual(report["group_count"], 0)
+        self.assertEqual(report["groups"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
