@@ -1,4 +1,5 @@
 import functools
+import os
 import torch
 
 _num_sms = 0
@@ -19,6 +20,17 @@ def set_num_sms(num_sms: int) -> None:
 def get_num_sms() -> int:
     global _num_sms
     if _num_sms == 0:
+        env_num_sms = os.environ.get('TILE_KERNELS_NUM_SMS')
+        if env_num_sms:
+            try:
+                value = int(env_num_sms)
+            except ValueError as exc:
+                raise ValueError('TILE_KERNELS_NUM_SMS must be an integer') from exc
+            if not 0 < value <= get_device_num_sms():
+                raise ValueError(
+                    f'TILE_KERNELS_NUM_SMS must be between 1 and {get_device_num_sms()}, got {value}'
+                )
+            return value
         return get_device_num_sms()
     return _num_sms
 
