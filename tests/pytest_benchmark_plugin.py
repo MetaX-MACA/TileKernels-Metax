@@ -355,6 +355,21 @@ def _collect_extras_keys(results, baselines):
 _jsonl_write_lock = threading.Lock()
 
 
+def _collect_environment_metadata():
+    metadata = {
+        'torch_version': torch.__version__,
+        'cuda_available': torch.cuda.is_available(),
+        'cuda_device_count': torch.cuda.device_count(),
+    }
+    if metadata['cuda_available'] and metadata['cuda_device_count'] > 0:
+        current_device = torch.cuda.current_device()
+        metadata.update({
+            'cuda_current_device': current_device,
+            'cuda_device_name': torch.cuda.get_device_name(current_device),
+        })
+    return metadata
+
+
 @pytest.fixture
 def benchmark_record(request):
     """Record a benchmark result for regression tracking.
@@ -403,6 +418,7 @@ def benchmark_record(request):
             'operation': operation,
             'params': dict(sorted(params.items())) if params else params,
             'time_us': round(time_us, 2),
+            'environment': _collect_environment_metadata(),
         }
         if bandwidth_gbs is not None:
             record['bandwidth_gbs'] = round(bandwidth_gbs, 4)
