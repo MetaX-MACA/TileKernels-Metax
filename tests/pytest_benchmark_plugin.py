@@ -68,6 +68,10 @@ def pytest_configure(config):
     if worker_id is not None:
         gpu_id = int(worker_id.replace('gw', ''))
         num_gpus = torch.cuda.device_count()
+        if num_gpus == 0:
+            raise pytest.UsageError(
+                'pytest-xdist GPU binding requires at least one visible CUDA device'
+            )
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id % num_gpus)
 
         # Restrict each worker's GPU memory to (total - 10 GB) / workers_per_gpu.
