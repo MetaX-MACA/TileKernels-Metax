@@ -353,21 +353,33 @@ def _collect_extras_keys(results, baselines):
 
 # Lock for concurrent JSONL writes from xdist workers
 _jsonl_write_lock = threading.Lock()
+_metadata_cache = None
 
 
 def _collect_environment_metadata():
+    global _metadata_cache
+    if _metadata_cache is not None:
+        return dict(_metadata_cache)
+
     metadata = {
         'torch_version': torch.__version__,
-        'cuda_available': torch.cuda.is_available(),
-        'cuda_device_count': torch.cuda.device_count(),
+        'cuda_available': False,
+        'cuda_device_count': 0,
     }
-    if metadata['cuda_available'] and metadata['cuda_device_count'] > 0:
-        current_device = torch.cuda.current_device()
-        metadata.update({
-            'cuda_current_device': current_device,
-            'cuda_device_name': torch.cuda.get_device_name(current_device),
-        })
-    return metadata
+    try:
+        metadata['cuda_available'] = torch.cuda.is_available()
+        metadata['cuda_device_count'] = torch.cuda.device_count()
+        if metadata['cuda_available'] and metadata['cuda_device_count'] > 0:
+            current_device = torch.cuda.current_device()
+            metadata.update({
+                'cuda_current_device': current_device,
+                'cuda_device_name': torch.cuda.get_device_name(current_device),
+            })
+    except (AssertionError, RuntimeError):
+        pass
+
+    _metadata_cache = dict(metadata)
+    return dict(metadata)
 
 
 @pytest.fixture
