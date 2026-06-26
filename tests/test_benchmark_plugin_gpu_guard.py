@@ -1,4 +1,4 @@
-import pytest
+import os
 
 
 class DummyConfig:
@@ -12,11 +12,12 @@ class DummyConfig:
         return False
 
 
-def test_xdist_gpu_binding_reports_no_visible_gpu(monkeypatch):
+def test_xdist_gpu_binding_skips_without_gpu(monkeypatch):
     import tests.pytest_benchmark_plugin as plugin
 
     monkeypatch.setenv('PYTEST_XDIST_WORKER', 'gw0')
     monkeypatch.setattr(plugin.torch.cuda, 'device_count', lambda: 0)
+    monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
 
-    with pytest.raises(pytest.UsageError, match='at least one visible CUDA device'):
-        plugin.pytest_configure(DummyConfig())
+    plugin.pytest_configure(DummyConfig())
+    assert 'CUDA_VISIBLE_DEVICES' not in os.environ
