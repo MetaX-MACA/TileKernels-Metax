@@ -9,6 +9,8 @@ def test_get_num_sms_reads_env_override(monkeypatch):
     monkeypatch.setenv('TILE_KERNELS_NUM_SMS', '64')
 
     assert config.get_num_sms() == 64
+    monkeypatch.setenv('TILE_KERNELS_NUM_SMS', '32')
+    assert config.get_num_sms() == 64
 
 
 def test_get_num_sms_rejects_invalid_env(monkeypatch):

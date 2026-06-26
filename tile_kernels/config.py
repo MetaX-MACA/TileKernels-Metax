@@ -30,8 +30,10 @@ def get_num_sms() -> int:
                 raise ValueError(
                     f'TILE_KERNELS_NUM_SMS must be between 1 and {get_device_num_sms()}, got {value}'
                 )
-            return value
-        return get_device_num_sms()
+            _num_sms = value
+            return _num_sms
+        _num_sms = get_device_num_sms()
+        return _num_sms
     return _num_sms
 
 
