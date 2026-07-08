@@ -38,26 +38,30 @@ def _mhc_pre_big_fuse(
         comb_mix: T.Tensor[(num_tokens, mhc_mult * mhc_mult), T.float32],
         layer_input: T.Tensor[(num_tokens, hidden_size), T.bfloat16],
     ) -> None:
-        with T.Kernel(num_tokens, threads=96) as pid:
+        with T.Kernel(num_tokens, threads=192) as pid:
             ##################################################################
             # _mhc_pre_norm_fn_fwd_norm
             mixes_shared = T.alloc_shared(mhc_mult3, T.float32)
-            if T.get_thread_binding() < 32:
+            if T.get_thread_binding() < 64:
                 rms = T.alloc_fragment(1, T.float32)
                 mixes = T.alloc_fragment(mhc_mult3, T.float32)
+                gemm_out_sqrsum_frag = T.alloc_fragment((n_splits, 1), T.float32)
+                gemm_out_mul_share = T.alloc_shared((n_splits, 1, mhc_mult3), T.float32)
                 T.clear(mixes)
                 rms[0] = 0
+                T.copy(gemm_out_sqrsum[:,pid],gemm_out_sqrsum_frag)
                 for i_split in T.serial(n_splits):
-                    rms[0] += gemm_out_sqrsum[i_split, pid]
+                    rms[0] += gemm_out_sqrsum_frag[i_split, 0]
                 rms[0] = T.rsqrt(rms[0] / (mhc_mult * hidden_size) + rms_eps)
+                T.copy(gemm_out_mul[:,pid,:],gemm_out_mul_share)
                 for j in T.Parallel(mhc_mult3):
                     mixes[j] = 0
                     for i_split in T.serial(n_splits):
-                        mixes[j] += gemm_out_mul[i_split, pid, j]
+                        mixes[j] += gemm_out_mul_share[i_split, 0, j]
                     mixes[j] *= rms[0]
                 T.copy(mixes, mixes_shared, disable_tma=True)
 
-            if T.get_thread_binding() < 32:
+            if T.get_thread_binding() < 128:
                 ##################################################################
                 # _mhc_pre_split_mixes_fwd (post & comb)
                 cm = T.alloc_fragment((mhc_mult, mhc_mult), T.float32)
