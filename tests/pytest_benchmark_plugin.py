@@ -65,7 +65,7 @@ def pytest_configure(config):
     # Bind each xdist worker to a GPU via CUDA_VISIBLE_DEVICES and restrict
     # per-process GPU memory so that concurrent workers don't OOM.
     worker_id = os.environ.get('PYTEST_XDIST_WORKER', None)
-    if worker_id is not None:
+    if worker_id is not None and torch.cuda.device_count() > 0:
         gpu_id = int(worker_id.replace('gw', ''))
         num_gpus = torch.cuda.device_count()
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id % num_gpus)
