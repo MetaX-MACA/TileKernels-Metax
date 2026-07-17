@@ -85,7 +85,7 @@ def _mhc_pre_norm_fn_fwd_mul(
         _ = mhc_mult3
         with T.Kernel(T.ceildiv(num_tokens, token_block), n_rms_group) as (pid_x, pid_y):
             out_frag = T.alloc_fragment((token_block, 32), T.float32)
-            sqrsum_part = T.alloc_fragment((token_block, 4), T.float32)
+            sqrsum_part = T.alloc_fragment(token_block, T.float32)
             T.clear(out_frag)
             T.clear(sqrsum_part)
             for pz in T.Pipelined(rms_group_size // hidden_block, num_stages=1):
@@ -102,9 +102,14 @@ def _mhc_pre_norm_fn_fwd_mul(
                 x_frag = T.alloc_fragment((token_block, hidden_block), T.float32)
                 T.copy(x_frag_16, x_frag)
 
-                for jj in T.serial(hidden_block // 4):
-                    for i, j in T.Parallel(token_block, 4):
-                        sqrsum_part[i, j] += x_frag[i, jj * 4 + j] * x_frag[i, jj * 4 + j]
+                # Compute sum of squares: first square each element, then reduce
+                x_sq = T.alloc_fragment((token_block, hidden_block), T.float32)
+                for i, j in T.Parallel(token_block, hidden_block):
+                    x_sq[i, j] = x_frag[i, j] * x_frag[i, j]
+                sqrsum_blk = T.alloc_fragment(token_block, T.float32)
+                T.reduce_sum(x_sq, sqrsum_blk)
+                for i in T.Parallel(token_block):
+                    sqrsum_part[i] += sqrsum_blk[i]
 
                 T.gemm(
                     x_frag,
@@ -114,10 +119,8 @@ def _mhc_pre_norm_fn_fwd_mul(
                     transpose_B=True,
                     clear_accum=False,
                 )
-            sqrsum_l = T.alloc_fragment(token_block, T.float32)
-            T.reduce_sum(sqrsum_part, sqrsum_l)
             for i in T.Parallel(token_block):
-                sqrsum[pid_x * token_block + i, pid_y] = sqrsum_l[i]
+                sqrsum[pid_x * token_block + i, pid_y] = sqrsum_part[i]
             for i, j in T.Parallel(token_block, 32):
                 if j < 24:
                     out[pid_x * token_block + i, pid_y, j] = out_frag[i, j]
