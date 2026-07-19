@@ -16,7 +16,15 @@ class MHCPreApplyMix(torch.autograd.Function):
         mhc = mix.shape[-2]
         assert mix.shape[-1] == 1
         ctx.fwd_kernel = _mhc_pre_apply_mix_fwd(mhc, h)
-        ctx.bwd_kernel = _mhc_pre_apply_mix_bwd(mhc, h)
+        # Backward shared-memory pressure has a different optimum than the forward kernel.
+        bwd_n_thr = 256 if h in (2560, 4096) else 128
+        bwd_h_blk = 512 if h in (2560, 4096, 7168) else 1024
+        ctx.bwd_kernel = _mhc_pre_apply_mix_bwd(
+            mhc,
+            h,
+            n_thr=bwd_n_thr,
+            h_blk=bwd_h_blk,
+        )
         if out is None:
             out = torch.empty(*x.shape[:-2], h, dtype=torch.bfloat16, device=x.device)
         ctx.fwd_kernel(x.view(-1, mhc, h), mix.view(-1, mhc), out.view(-1, h))
@@ -38,7 +46,14 @@ class MHCPreApplyMix(torch.autograd.Function):
             x_grad = None
         else:
             x_grad = torch.zeros_like(x)
-            mix_grad = ctx.bwd_kernel(
+            zero_grad_bwd_kernel = _mhc_pre_apply_mix_bwd(
+                mhc,
+                h,
+                n_thr=256 if h in (2560, 4096) else 128,
+                h_blk=512 if h in (2560, 4096, 7168) else 1024,
+                x_grad_is_zero=True,
+            )
+            mix_grad = zero_grad_bwd_kernel(
                 o_grad.view(-1, h),
                 x.view(-1, mhc, h),
                 mix.view(-1, mhc),

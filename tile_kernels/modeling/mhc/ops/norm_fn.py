@@ -8,6 +8,7 @@ from tile_kernels.mhc.norm_fn_kernel import (
     _mhc_pre_norm_fn_bwd_norm,
     _mhc_pre_norm_fn_fwd_mul,
     _mhc_pre_norm_fn_fwd_norm,
+    _mhc_pre_norm_fn_fwd_sqsum,
     round_to_tf32,
 )
 
@@ -92,13 +93,42 @@ class MHCPreNormFn(torch.autograd.Function):
 
         fn = round_to_tf32(fn)
 
-        fwd_mul_kernel = _mhc_pre_norm_fn_fwd_mul(mhc_mult3, 1, mhc_hidden_size)
-        fwd_mul_kernel(
-            x.view(-1, mhc_hidden_size),
-            fn,
-            out_mul_splitted.view(-1, 1, mhc_mult3),
-            sqrsum_splitted.view(-1, 1),
+        num_tokens = x.numel() // mhc_hidden_size
+        x_flat = x.view(-1, mhc_hidden_size)
+        use_library_gemm = (
+            num_tokens == 4096 and mhc_hidden_size >= 5120
+        ) or (
+            num_tokens >= 8192 and mhc_hidden_size >= 16384
         )
+        if use_library_gemm:
+            # mcBLAS handles the narrow-N BF16 GEMM efficiently; retain the reduction in TileLang.
+            bf16_mul = torch.empty(
+                num_tokens,
+                mhc_mult3,
+                dtype=torch.bfloat16,
+                device=x.device,
+            )
+            torch.matmul(x_flat, fn.bfloat16().t(), out=bf16_mul)
+            out_mul_splitted.view(-1, mhc_mult3).copy_(bf16_mul)
+            _mhc_pre_norm_fn_fwd_sqsum(mhc_hidden_size)(
+                x_flat,
+                sqrsum_splitted.view(-1),
+            )
+        else:
+            use_bf16_mma = num_tokens >= 4096
+            fwd_mul_kernel = _mhc_pre_norm_fn_fwd_mul(
+                mhc_mult3,
+                1,
+                mhc_hidden_size,
+                use_bf16_mma=use_bf16_mma,
+                fn_is_bf16=use_bf16_mma,
+            )
+            fwd_mul_kernel(
+                x_flat,
+                fn.bfloat16() if use_bf16_mma else fn,
+                out_mul_splitted.view(-1, 1, mhc_mult3),
+                sqrsum_splitted.view(-1, 1),
+            )
         # END of TileLang implementation of pre-norm-fn forward matmul
 
         out_mul = torch.empty_like(out_mul_splitted[0])
@@ -154,7 +184,15 @@ class MHCPreNormFn(torch.autograd.Function):
 
         out_mul_grad = round_to_tf32(out_mul_grad)
 
-        bwd_mul_kernel = _mhc_pre_norm_fn_bwd_mul(mhc_mult3, 1, mhc_hidden_size)
+        num_tokens = x.numel() // mhc_hidden_size
+        bwd_token_block = 32 if num_tokens >= 8192 and mhc_hidden_size >= 10240 else 64
+        bwd_mul_kernel = _mhc_pre_norm_fn_bwd_mul(
+            mhc_mult3,
+            1,
+            mhc_hidden_size,
+            token_block=bwd_token_block,
+            x_grad_is_zero=not ctx.fuse_grad_acc,
+        )
         bwd_mul_kernel(
             out_mul_grad.view(-1, 1, mhc_mult3),
             sqrsum_grad.view(-1, 1),

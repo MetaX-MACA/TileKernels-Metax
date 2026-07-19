@@ -15,16 +15,14 @@ class _SinkhornNormalize(torch.autograd.Function):
         output = torch.empty_like(x)
         # Choose token_block_size based on input size for optimal performance
         n = x.shape[0]
-        if n >= 16384 and n % 32 == 0:
-            token_block_size = 32
-        elif n >= 4096 and n % 16 == 0:
+        if n >= 4096 and n % 16 == 0:
             token_block_size = 16
         elif n % 4 == 0:
             token_block_size = 4
         else:
             token_block_size = 1
         fwd_kernel = _mhc_sinkhorn_fwd(hidden_size, token_block_size, repeat, eps)
-        bwd_kernel = _mhc_sinkhorn_bwd(hidden_size, 32, repeat, eps)
+        bwd_kernel = _mhc_sinkhorn_bwd(hidden_size, 8, repeat, eps)
         ctx.save_for_backward(x)
         ctx.bwd_kernel = bwd_kernel
         fwd_kernel(x, output)

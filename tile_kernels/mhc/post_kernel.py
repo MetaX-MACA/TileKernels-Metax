@@ -14,7 +14,7 @@ from tilelang import language as T
         tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
     },
 )
-def _mhc_post_fwd(mhc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024) -> tilelang.JITKernel:
+def _mhc_post_fwd(mhc: int, hidden: int, n_thr: int = 512, h_blk: int = 1024) -> tilelang.JITKernel:
     n = T.dynamic('num_tokens')
     h = hidden
 
@@ -79,12 +79,6 @@ def _mhc_post_bwd(mhc: int, hidden: int, n_thr: int = 128, h_blk: int = 256) -> 
         dd: T.Tensor[(n, h), T.bfloat16],
     ) -> None:
         with T.Kernel(n, threads=n_thr) as pid_n:
-            dx_shared = T.alloc_shared((4, h_blk), T.bfloat16)
-            b_shared = T.alloc_shared((4, h_blk), T.bfloat16)
-            db_shared = T.alloc_shared((4, h_blk), T.bfloat16)
-            d_shared = T.alloc_shared(h_blk, T.bfloat16)
-            dd_shared = T.alloc_shared(h_blk, T.bfloat16)
-
             dx_local = T.alloc_fragment((4, h_blk), T.float32)
             b_local = T.alloc_fragment((4, h_blk), T.float32)
             db_local = T.alloc_fragment((4, h_blk), T.float32)
@@ -102,13 +96,9 @@ def _mhc_post_bwd(mhc: int, hidden: int, n_thr: int = 128, h_blk: int = 256) -> 
             T.clear(dc_reducer)
 
             for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=3):
-                T.copy(dx[pid_n, 0, i0_h * h_blk], dx_shared, disable_tma=True)
-                T.copy(b[pid_n, 0, i0_h * h_blk], b_shared, disable_tma=True)
-                T.copy(d[pid_n, i0_h * h_blk], d_shared, disable_tma=True)
-
-                T.copy(dx_shared, dx_local)
-                T.copy(b_shared, b_local)
-                T.copy(d_shared, d_local)
+                T.copy(dx[pid_n, 0, i0_h * h_blk], dx_local, disable_tma=True)
+                T.copy(b[pid_n, 0, i0_h * h_blk], b_local, disable_tma=True)
+                T.copy(d[pid_n, i0_h * h_blk], d_local, disable_tma=True)
 
                 # da and db
                 T.clear(db_local)
@@ -125,11 +115,8 @@ def _mhc_post_bwd(mhc: int, hidden: int, n_thr: int = 128, h_blk: int = 256) -> 
                         dc_reducer[i_mhc] += d_local[i1_h] * dx_local[i_mhc, i1_h]
                         dd_local[i1_h] += c_local[i_mhc] * dx_local[i_mhc, i1_h]
 
-                T.copy(db_local, db_shared)
-                T.copy(dd_local, dd_shared)
-
-                T.copy(db_shared, db[pid_n, 0, i0_h * h_blk], disable_tma=True)
-                T.copy(dd_shared, dd[pid_n, i0_h * h_blk], disable_tma=True)
+                T.copy(db_local, db[pid_n, 0, i0_h * h_blk], disable_tma=True)
+                T.copy(dd_local, dd[pid_n, i0_h * h_blk], disable_tma=True)
 
             T.finalize_reducer(da_reducer)
             T.finalize_reducer(dc_reducer)
@@ -186,7 +173,8 @@ def mhc_post_bwd(
     mhc = d_o.shape[2]
     h = d_o.shape[3]
 
-    bwd_kernel = _mhc_post_bwd(mhc, h)
+    # A second Wave64 improves the larger hidden shapes, while 1280 remains launch-overhead bound.
+    bwd_kernel = _mhc_post_bwd(mhc, h, n_thr=256 if h > 1280 else 128)
     (
         d_comb_res_mix,
         d_residual,

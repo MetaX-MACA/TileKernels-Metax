@@ -14,8 +14,19 @@ class ExpandToMHCFn(torch.autograd.Function):
         if out is None:
             out = hidden.new_empty(*hidden.shape[:-1], mhc_mult, hidden.shape[-1])
         assert hidden.is_contiguous()
-        kernel = expand_to_mhc_fwd_tl(hidden.shape[-1], mhc_mult)
-        kernel(hidden.flatten(0, -2), out.flatten(0, -3))
+        hidden_flat = hidden.flatten(0, -2)
+        num_tokens = hidden_flat.shape[0]
+        use_blk_n64 = num_tokens % 64 == 0 and not (
+            num_tokens >= 8192 and hidden.shape[-1] == 1280
+        )
+        use_blk_h256 = use_blk_n64 and hidden.shape[-1] >= 4096
+        kernel = expand_to_mhc_fwd_tl(
+            hidden.shape[-1],
+            mhc_mult,
+            blk_n=64 if use_blk_n64 else 32,
+            blk_h=256 if use_blk_h256 else 128,
+        )
+        kernel(hidden_flat, out.flatten(0, -3))
         return out
 
     @staticmethod
