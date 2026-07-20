@@ -40,7 +40,7 @@ def get_topk_group_idx(
 
     # Count the number of groups that have a larger top2 sum
     for i in T.unroll(num_groups):
-        other_top2_sum = T.shfl_sync(topk_sum_var, i)
+        other_top2_sum = T.shfl_sync(topk_sum_var, i, width=32)
         if other_top2_sum > topk_sum_var or (other_top2_sum == topk_sum_var and i < lane_idx):
             count_var += 1
 

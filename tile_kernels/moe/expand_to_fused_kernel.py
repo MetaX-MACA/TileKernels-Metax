@@ -22,7 +22,7 @@ def get_expand_to_fused_kernel(
     x_dtype: T.dtype,
     sf_dtype: T.dtype,
 ):
-    num_threads = 64
+    num_threads = 256 if x_dtype == T.float8_e4m3fn else 512
 
     hidden_aligned = align(hidden, num_threads)
     if num_per_channels is not None:
@@ -37,8 +37,6 @@ def get_expand_to_fused_kernel(
     sf_stride = T.dynamic('sf_stride')
     num_tokens = T.dynamic('num_tokens')
     num_expanded_tokens = T.dynamic('num_expanded_tokens')
-    num_blocks = T.max(num_tokens, num_expanded_tokens)
-
     sf_shape = (hidden_sf, num_expanded_tokens) if use_tma_aligned_col_major_sf else (num_expanded_tokens, hidden_sf)
 
     @T.prim_func
@@ -50,23 +48,19 @@ def get_expand_to_fused_kernel(
         token_topk_to_pos: T.Tensor[(num_tokens, num_topk), T.int32],
         pos_to_expert: T.Tensor[(num_expanded_tokens, ), T.int32]
     ):
-        with T.Kernel(num_blocks, threads=num_threads) as (pid_token, ):
+        with T.Kernel(num_tokens, threads=num_threads) as (pid_token, ):
             pos_local = T.alloc_local((num_topk, ), T.int32)
 
-            if pid_token < num_expanded_tokens:
-                if pos_to_expert[pid_token] < 0:
+            for output_pos in T.serial(pid_token, num_expanded_tokens, num_tokens):
+                if pos_to_expert[output_pos] < 0:
                     for i in T.Parallel(hidden_aligned):
-                        expanded_x[pid_token, i] = 0
+                        expanded_x[output_pos, i] = 0
                     if num_per_channels is not None:
                         for i in T.Parallel(hidden_sf_aligned):
                             if use_tma_aligned_col_major_sf:
-                                expanded_x_sf[i, pid_token] = 0
+                                expanded_x_sf[i, output_pos] = 0
                             else:
-                                expanded_x_sf[pid_token, i] = 0
-
-            if pid_token >= num_tokens:
-                T.thread_return()
-            T.assume(pid_token < num_tokens)
+                                expanded_x_sf[output_pos, i] = 0
 
             x_fragment = T.alloc_fragment((hidden_aligned, ), x_dtype)
             x_sf_fragment = T.alloc_fragment((hidden_sf_aligned, ), sf_dtype)

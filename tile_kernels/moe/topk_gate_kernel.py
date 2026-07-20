@@ -4,8 +4,6 @@ import tilelang
 import torch
 from tilelang import language as T
 
-from tile_kernels.utils import align
-
 
 @tilelang.jit(
     pass_configs={
@@ -14,43 +12,59 @@ from tile_kernels.utils import align
 )
 def get_topk_gate_kernel(num_experts: int, num_topk: int):
     num_tokens = T.dynamic('num_tokens')
-    num_threads = 32
-    num_aligned_experts = align(num_experts, num_threads)
+    subgroup_size = 32
+    num_threads = 64
+    num_tokens_per_block = num_threads // subgroup_size
+    num_experts_per_lane = (num_experts + subgroup_size - 1) // subgroup_size
 
     @T.prim_func
     def topk_gate_kernel(
         scores: T.Tensor[(num_tokens, num_experts), T.float32],
         topk_idx: T.Tensor[(num_tokens, num_topk), T.int64],
     ):
-        with T.Kernel(num_tokens, threads=num_threads) as pid:
-            scores_fragment = T.alloc_fragment((num_aligned_experts,), T.float32)
-            amax_fragment = T.alloc_fragment((1,), T.float32)
-            idx_fragment = T.alloc_fragment((num_aligned_experts,), T.int32)
-            idx_reducer = T.alloc_reducer((1,), T.int32, 'min', replication='all')
-            topk_idx_shared = T.alloc_shared((num_topk,), T.int32)
+        with T.Kernel(T.ceildiv(num_tokens, num_tokens_per_block), threads=num_threads) as pid:
+            thread_idx = T.get_thread_binding()
+            token_idx = thread_idx // subgroup_size
+            lane_idx = thread_idx % subgroup_size
+            token = pid * num_tokens_per_block + token_idx
 
-            for i in T.Parallel(num_aligned_experts):
-                if i < num_experts:
-                    scores_fragment[i] = scores[pid, i]
+            key_local = T.alloc_local((num_experts_per_lane,), T.uint64)
+            idx_local = T.alloc_local((num_experts_per_lane,), T.int32)
+            topk_key_var = T.alloc_var(T.uint64)
+            other_key = T.alloc_var(T.uint64)
+
+            for i in T.unroll(num_experts_per_lane):
+                expert_idx = lane_idx + i * subgroup_size
+                idx_local[i] = expert_idx
+                if token < num_tokens and expert_idx < num_experts:
+                    score_bits = T.reinterpret(scores[token, expert_idx], T.uint32)
+                    magnitude = score_bits & T.uint32(0x7FFFFFFF)
+                    is_nan = magnitude > T.uint32(0x7F800000)
+                    is_negative = ((score_bits & T.uint32(0x80000000)) != 0) & (magnitude != 0)
+                    normalized_bits = T.Select(magnitude == 0, T.uint32(0), score_bits)
+                    ordered_score = T.Select(
+                        is_nan,
+                        T.Select(is_negative, T.uint32(0), T.uint32(0xFFFFFFFF)),
+                        T.Select(is_negative, ~normalized_bits, normalized_bits ^ T.uint32(0x80000000)),
+                    )
+                    key_local[i] = (T.uint64(ordered_score) << 32) | T.uint64(T.uint32(~expert_idx))
                 else:
-                    scores_fragment[i] = -T.infinity(T.float32)
-            for i in T.Parallel(num_aligned_experts):
-                idx_fragment[i] = i
+                    key_local[i] = T.uint64(0)
 
-            # Get topk via repeatly finding max
+            # Repeated argmax with one 32-lane tournament per selected expert.
             for k in T.unroll(num_topk):
-                T.reduce_max(scores_fragment, amax_fragment)
-                T.fill(idx_reducer, T.max_value(T.int32))
-                for i in T.Parallel(num_aligned_experts):
-                    if scores_fragment[i] == amax_fragment[0]:
-                        idx_reducer[0] = T.min(idx_reducer[0], idx_fragment[i])
-                T.finalize_reducer(idx_reducer)
-                topk_idx_shared[k] = idx_reducer[0]
-                for i in T.Parallel(num_aligned_experts):
-                    if idx_fragment[i] == idx_reducer[0]:
-                        scores_fragment[i] = -T.infinity(T.float32)
-
-            T.copy(topk_idx_shared, topk_idx[pid, 0], disable_tma=True)
+                topk_key_var = T.uint64(0)
+                for i in T.unroll(num_experts_per_lane):
+                    topk_key_var = T.max(topk_key_var, key_local[i])
+                for i in T.unroll(5):
+                    other_key = T.shfl_xor(topk_key_var, 1 << i, width=subgroup_size)
+                    topk_key_var = T.max(topk_key_var, other_key)
+                topk_idx_local = T.cast(T.uint32(~T.uint32(topk_key_var)), T.int32)
+                if token < num_tokens and lane_idx == 0:
+                    topk_idx[token, k] = topk_idx_local
+                for i in T.unroll(num_experts_per_lane):
+                    if idx_local[i] == topk_idx_local:
+                        key_local[i] = T.uint64(0)
 
     return topk_gate_kernel
 

@@ -13,7 +13,13 @@ from tile_kernels.moe.common import get_topk_group_idx
 def warp_reduce_sum(x: T.Ref):
     # Keep the same with the old implementation
     for i in T.unroll(0, 5):
-        x += T.shfl_xor(x, 1 << (4 - i))
+        x += T.shfl_xor(x, 1 << (4 - i), width=32)
+
+
+@T.macro
+def warp_reduce_max(x: T.Ref):
+    for i in T.unroll(0, 5):
+        x = T.max(x, T.shfl_xor(x, 1 << (4 - i), width=32))
 
 
 @tilelang.jit(
@@ -33,10 +39,11 @@ def get_top2_sum_gate_kernel(
 ):  # fmt: off
     # Kernel config
     warp_size = 32
-    num_threads = 32
+    use_wave64 = num_routed_experts % 64 == 0
+    num_threads = 64 if use_wave64 else 32
     assert num_topk <= warp_size, f'num_topk must be less than or equal to {warp_size}'
 
-    # Each warp handles one token
+    # Each 32-lane subgroup handles one token.
     num_tokens_per_block = num_threads // warp_size
 
     # Keep the same with the old implementation
@@ -95,7 +102,7 @@ def get_top2_sum_gate_kernel(
         tp_rank: T.int32,
         num_tp_ranks: T.int32,
     ):
-        with T.Kernel(num_tokens, threads=num_threads) as pid:
+        with T.Kernel(T.ceildiv(num_tokens, num_tokens_per_block), threads=num_threads) as pid:
             thread_idx = T.get_thread_binding()
             token_idx = thread_idx // 32
             global_token_idx = token_idx + pid * num_tokens_per_block
@@ -106,27 +113,30 @@ def get_top2_sum_gate_kernel(
 
             bias_local = T.alloc_local((num_routed_experts_per_thread,), dtype=T.float32)
             scores_local = T.alloc_local((num_routed_experts_per_thread,), dtype=T.float32)
+            key_local = T.alloc_local((num_routed_experts_per_thread,), dtype=T.uint64)
             idx_local = T.alloc_local((num_routed_experts_per_thread,), dtype=T.int32)
             topk_group_idx_shared = T.alloc_shared((num_tokens_per_block, num_topk_groups), dtype=T.int32)
-            topk_scores_local = T.alloc_local(num_topk, dtype=T.float32)
             topk_idx_local = T.alloc_local(num_topk, dtype=T.int32)
             topk_group_idx_local = T.alloc_local(num_topk_groups, dtype=T.int32)
 
             logit_max_var = T.alloc_var(dtype=T.float32)
             logit_sum_var = T.alloc_var(dtype=T.float32)
-            other_idx = T.alloc_var(dtype=T.int32)
+            topk_key_var = T.alloc_var(dtype=T.uint64)
+            other_key = T.alloc_var(dtype=T.uint64)
             topk_score_var = T.alloc_var(dtype=T.float32)
             topk_idx_var = T.alloc_var(dtype=T.int64)
             topk_sum_var = T.alloc_var(dtype=T.float32)
+            token_exists = T.alloc_var(dtype=T.int32, init=0)
+            token_active = T.alloc_var(dtype=T.int32, init=0)
+            fixed_route = T.alloc_var(dtype=T.int32, init=0)
 
-            # Tokens with mask = 0 does not participate in routing
-            if mask_exists and not mask[global_token_idx]:
-                if lane_idx < num_topk and unmapped_topk_idx_exists:
-                    unmapped_topk_idx[global_token_idx, lane_idx] = -1
-                if lane_idx < num_physical_topk:
-                    topk_idx[global_token_idx, lane_idx] = -1
-                    topk_weights[global_token_idx, lane_idx] = 0.0
-                T.thread_return()
+            if global_token_idx < num_tokens:
+                token_exists = 1
+                token_active = 1
+                if mask_exists and not mask[global_token_idx]:
+                    token_active = 0
+                if fix_routing_mask_exists and fix_routing_mask[global_token_idx]:
+                    fixed_route = 1
 
             # Load and do activation functions
             logit_max_var = -T.infinity(T.float32)
@@ -142,8 +152,12 @@ def get_top2_sum_gate_kernel(
                 start_expert_idx = i * num_vectorize * warp_size + lane_idx * num_vectorize
                 if start_expert_idx < num_routed_experts:
                     for j in T.vectorized(num_vectorize):
-                        scores_local[i * num_vectorize + j] = logits[global_token_idx, start_expert_idx + j]
-                        bias_local[i * num_vectorize + j] = bias[start_expert_idx + j]
+                        if token_active != 0:
+                            scores_local[i * num_vectorize + j] = logits[global_token_idx, start_expert_idx + j]
+                            bias_local[i * num_vectorize + j] = bias[start_expert_idx + j]
+                        else:
+                            scores_local[i * num_vectorize + j] = 0.0
+                            bias_local[i * num_vectorize + j] = 0.0
                         if scoring_type == 2:  # SOFTMAX
                             scores_shared[token_idx, start_expert_idx + j] = scores_local[i * num_vectorize + j]
 
@@ -155,7 +169,7 @@ def get_top2_sum_gate_kernel(
             if scoring_type == 2:  # SOFTMAX
                 for i in T.unroll(num_routed_experts_per_thread):
                     logit_max_var = T.max(logit_max_var, scores_local[i])
-                logit_max_var = T.warp_reduce_max(logit_max_var)
+                warp_reduce_max(logit_max_var)
                 for i in T.unroll(0, T.ceildiv(num_routed_experts, num_vectorize * warp_size)):
                     if i * num_vectorize * warp_size + lane_idx * num_vectorize < num_routed_experts:
                         for j in T.unroll(num_vectorize):
@@ -195,20 +209,22 @@ def get_top2_sum_gate_kernel(
             # Ensure all shared memory stores are completed
             T.sync_warp()
 
-            if not fix_routing_mask_exists or not fix_routing_mask[global_token_idx]:
+            # Group ranking contains a synchronization. Run it for both logical
+            # 32-lane subgroups before diverging on the per-token fixed route.
+            if not skip_group_sort:
+                get_topk_group_idx(
+                    scores_shared,
+                    topk_group_idx_shared,
+                    num_groups,
+                    num_routed_experts_per_group,
+                    num_topk_groups,
+                    num_topk_sum,
+                    num_vectorize_for_grouped_expert,
+                )
+
+            if fixed_route == 0:
                 # Get `num_topk_groups` groups with the largest top2-sum
                 if not skip_group_sort:
-                    # Get topk group indices
-                    get_topk_group_idx(
-                        scores_shared,
-                        topk_group_idx_shared,
-                        num_groups,
-                        num_routed_experts_per_group,
-                        num_topk_groups,
-                        num_topk_sum,
-                        num_vectorize_for_grouped_expert,
-                    )
-
                     # Sort group indices in ascending order to ensure stable sort
                     for i in T.vectorized(num_topk_groups):
                         topk_group_idx_local[i] = topk_group_idx_shared[token_idx, i]
@@ -228,25 +244,34 @@ def get_top2_sum_gate_kernel(
                             scores_local[i] = scores_shared[token_idx, select_group_idx * num_routed_experts_per_group + lane_idx]
                             idx_local[i] = select_group_idx * num_routed_experts_per_group + lane_idx
 
-                # Get topk via repeatly finding max
-                for k in T.unroll(num_topk):
-                    # Get local max score
-                    topk_scores_local[k] = -T.infinity(T.float32)
-                    for i in T.unroll(0, num_routed_experts_per_thread):
-                        if k != 0 and topk_idx_local[k - 1] == idx_local[i]:
-                            scores_local[i] = -T.infinity(T.float32)
-                        # If j > i, then idx_local[j] > idx_local[i]
-                        elif scores_local[i] > topk_scores_local[k]:
-                            topk_scores_local[k] = scores_local[i]
-                            topk_idx_local[k] = idx_local[i]
+                # Pack descending score and ascending index into one key so the
+                # warp tournament exchanges one value rather than score + index.
+                for i in T.unroll(num_routed_experts_per_thread):
+                    score_bits = T.reinterpret(scores_local[i], T.uint32)
+                    magnitude = score_bits & T.uint32(0x7FFFFFFF)
+                    is_negative = ((score_bits & T.uint32(0x80000000)) != 0) & (magnitude != 0)
+                    normalized_bits = T.Select(magnitude == 0, T.uint32(0), score_bits)
+                    ordered_score = T.Select(is_negative, ~normalized_bits, normalized_bits ^ T.uint32(0x80000000))
+                    candidate_key = (T.uint64(ordered_score) << 32) | T.uint64(T.uint32(~idx_local[i]))
+                    key_local[i] = T.Select(idx_local[i] >= 0, candidate_key, T.uint64(0))
 
-                    # Get max score across all threads
+                # Get topk via repeatedly finding max.
+                for k in T.unroll(num_topk):
+                    if k != 0:
+                        for i in T.unroll(num_routed_experts_per_thread):
+                            if topk_idx_local[k - 1] == idx_local[i]:
+                                key_local[i] = 0
+
+                    # Get local max key.
+                    topk_key_var = T.uint64(0)
+                    for i in T.unroll(0, num_routed_experts_per_thread):
+                        topk_key_var = T.max(topk_key_var, key_local[i])
+
+                    # Get max key across all threads.
                     for i in T.unroll(5):
-                        other_score = T.shfl_xor(topk_scores_local[k], 1 << i)
-                        other_idx = T.shfl_xor(topk_idx_local[k], 1 << i)
-                        if other_score > topk_scores_local[k] or (other_score == topk_scores_local[k] and other_idx < topk_idx_local[k]):
-                            topk_scores_local[k] = other_score
-                            topk_idx_local[k] = other_idx
+                        other_key = T.shfl_xor(topk_key_var, 1 << i, width=32)
+                        topk_key_var = T.max(topk_key_var, other_key)
+                    topk_idx_local[k] = T.cast(T.uint32(~T.uint32(topk_key_var)), T.int32)
 
                 topk_score_var = 0.0
                 if lane_idx < num_topk:
@@ -262,43 +287,50 @@ def get_top2_sum_gate_kernel(
             # Get topk sum
             topk_sum_var = 1e-20
             for i in T.unroll(num_topk):
-                topk_sum_var += T.shfl_sync(topk_score_var, i)
+                topk_sum_var += T.shfl_sync(topk_score_var, i, width=32)
 
             # Ensure one warp can handle one token
             T.device_assert(num_physical_topk <= warp_size)
 
-            # Normalize top-k weights
-            if lane_idx < num_topk:
-                # NOTES: If this fails, there may be some NaN values in logits input or internal error in the kernel
-                T.device_assert(topk_idx_var >= 0)
-                topk_score_var = topk_score_var / topk_sum_var * routed_scaling_factor
-                if unmapped_topk_idx_exists:
-                    unmapped_topk_idx[global_token_idx, lane_idx] = topk_idx_var
-            elif lane_idx < num_physical_topk:
-                topk_score_var = 1.0
-                topk_idx_var = lane_idx + (num_routed_experts - num_topk)
+            if token_active != 0:
+                # Normalize top-k weights
+                if lane_idx < num_topk:
+                    # NOTES: If this fails, there may be some NaN values in logits input or internal error in the kernel
+                    T.device_assert(topk_idx_var >= 0)
+                    topk_score_var = topk_score_var / topk_sum_var * routed_scaling_factor
+                    if unmapped_topk_idx_exists:
+                        unmapped_topk_idx[global_token_idx, lane_idx] = topk_idx_var
+                elif lane_idx < num_physical_topk:
+                    topk_score_var = 1.0
+                    topk_idx_var = lane_idx + (num_routed_experts - num_topk)
 
-            # Map to physical experts
-            if to_physical_map_exists and lane_idx < num_physical_topk:
-                logical_expert_idx = topk_idx_var
-                num_duplicates = logical_count[logical_expert_idx]
-                duplicate_idx = (ep_rank + global_token_idx * large_prime_number) % num_duplicates
-                topk_idx_var = to_physical_map[logical_expert_idx, duplicate_idx]
+                # Map to physical experts
+                if to_physical_map_exists and lane_idx < num_physical_topk:
+                    logical_expert_idx = topk_idx_var
+                    num_duplicates = logical_count[logical_expert_idx]
+                    duplicate_idx = (ep_rank + global_token_idx * large_prime_number) % num_duplicates
+                    topk_idx_var = to_physical_map[logical_expert_idx, duplicate_idx]
 
-            # Mask ETP idx
-            num_experts_per_rank = (num_routed_experts + num_extra_experts) // num_ep_ranks
-            num_experts_per_dp = num_experts_per_rank * num_tp_ranks
-            if lane_idx < num_physical_topk:
-                dst_ep_rank = topk_idx_var // num_experts_per_rank
-                if dst_ep_rank % num_tp_ranks != T.int64(tp_rank):
-                    topk_idx_var = -1
-                else:
-                    topk_idx_var -= tp_rank * num_experts_per_rank
-                    dst_dp_rank = topk_idx_var // num_experts_per_dp
-                    topk_idx_var = topk_idx_var - dst_dp_rank * num_experts_per_dp + dst_dp_rank * num_experts_per_rank
-                    topk_idx_var = T.if_then_else(topk_idx_var < 0, -1, topk_idx_var)
-                topk_idx[global_token_idx, lane_idx] = topk_idx_var
-                topk_weights[global_token_idx, lane_idx] = topk_score_var
+                # Mask ETP idx
+                num_experts_per_rank = (num_routed_experts + num_extra_experts) // num_ep_ranks
+                num_experts_per_dp = num_experts_per_rank * num_tp_ranks
+                if lane_idx < num_physical_topk:
+                    dst_ep_rank = topk_idx_var // num_experts_per_rank
+                    if dst_ep_rank % num_tp_ranks != T.int64(tp_rank):
+                        topk_idx_var = -1
+                    else:
+                        topk_idx_var -= tp_rank * num_experts_per_rank
+                        dst_dp_rank = topk_idx_var // num_experts_per_dp
+                        topk_idx_var = topk_idx_var - dst_dp_rank * num_experts_per_dp + dst_dp_rank * num_experts_per_rank
+                        topk_idx_var = T.if_then_else(topk_idx_var < 0, -1, topk_idx_var)
+                    topk_idx[global_token_idx, lane_idx] = topk_idx_var
+                    topk_weights[global_token_idx, lane_idx] = topk_score_var
+            elif token_exists != 0:
+                if lane_idx < num_topk and unmapped_topk_idx_exists:
+                    unmapped_topk_idx[global_token_idx, lane_idx] = -1
+                if lane_idx < num_physical_topk:
+                    topk_idx[global_token_idx, lane_idx] = -1
+                    topk_weights[global_token_idx, lane_idx] = 0.0
 
     return top2_sum_gate_kernel
 
