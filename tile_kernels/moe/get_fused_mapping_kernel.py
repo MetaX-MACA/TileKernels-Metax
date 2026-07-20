@@ -29,12 +29,17 @@ def get_get_fused_mapping_kernel(
     alignment: int,
     num_sms: int,
 ):
-    num_threads = 256
+    # __match_any_sync returns a 32-bit lane mask on this lowering. Keep one
+    # logical 32-lane match group in each hardware wave.
+    # The short top-k path has less work per worker; 256 threads lowers its
+    # fixed grid-sync cost, while longer routes benefit from 512 threads.
+    num_threads = 256 if num_topk == 2 else 512
     while num_threads < num_experts:
         num_threads *= 2
     assert num_threads <= 1024 and num_threads >= num_experts
-    warp_size = 64
-    num_warps = num_threads // warp_size
+    hardware_warp_size = 64
+    match_group_size = 32
+    num_warps = num_threads // hardware_warp_size
 
     num_global_warps = num_sms * num_warps
     num_global_threads = num_threads * num_sms
@@ -56,8 +61,8 @@ def get_get_fused_mapping_kernel(
     ):
         with T.Kernel(num_sms, threads=num_threads) as (sm_idx,):
             thread_idx = T.get_thread_binding(0)
-            warp_idx = thread_idx // warp_size
-            lane_idx = thread_idx % warp_size
+            warp_idx = thread_idx // hardware_warp_size
+            lane_idx = thread_idx % hardware_warp_size
             global_thread_idx = sm_idx * num_threads + thread_idx
             global_warp_idx = sm_idx * num_warps + warp_idx
             numel = num_tokens * num_topk
@@ -73,8 +78,9 @@ def get_get_fused_mapping_kernel(
             topk_idx_1d = T.view(topk_idx, (num_tokens * num_topk,))
             token_topk_to_pos_1d = T.view(token_topk_to_pos, (num_tokens * num_topk,))
 
-            for i in T.serial(lane_idx, num_experts, warp_size):
-                experts_sum_per_warp_shared[warp_idx, i] = 0
+            if lane_idx < match_group_size:
+                for i in T.serial(lane_idx, num_experts, match_group_size):
+                    experts_sum_per_warp_shared[warp_idx, i] = 0
             T.sync_warp()
 
             for i in T.serial(global_thread_idx, num_expanded_tokens, num_global_threads):
@@ -89,12 +95,13 @@ def get_get_fused_mapping_kernel(
             end = T.alloc_var(T.int32)
             divide_task(numel, num_global_warps, global_warp_idx, start, end)
 
-            for i in T.serial(start + lane_idx, end, warp_size):
-                T.assume(0 <= i < numel)
-                expert_idx = topk_idx_1d[i]
-                if expert_idx != -1:
-                    T.assume(0 <= expert_idx < num_experts)
-                    T.atomic_add(experts_sum_per_warp_shared[warp_idx, expert_idx], 1)
+            if lane_idx < match_group_size:
+                for i in T.serial(start + lane_idx, end, match_group_size):
+                    T.assume(0 <= i < numel)
+                    expert_idx = topk_idx_1d[i]
+                    if expert_idx != -1:
+                        T.assume(0 <= expert_idx < num_experts)
+                        T.atomic_add(experts_sum_per_warp_shared[warp_idx, expert_idx], 1)
 
             T.sync_threads()
 
@@ -140,26 +147,27 @@ def get_get_fused_mapping_kernel(
             T.sync_threads()
 
             divide_task(numel, num_global_warps, global_warp_idx, start, end)
-            aligned_end = align(end, warp_size)
-            lane_mask = T.uint64(1 << lane_idx) + T.uint64(1 << lane_idx) - 1
-            lane_mask_rev = ~lane_mask
-            for i in T.serial(start + lane_idx, aligned_end, warp_size):
-                T.assume(0 <= i)
-                expert_idx = T.Select(i < numel, T.int32(topk_idx_1d[i]), -1)
-                mask = T.call_extern(T.uint64, '__match_any_sync', tilelang.tvm.tir.const(0xFFFFFFFFFFFFFFFF, T.uint64), expert_idx)
-                count = T.popcount(mask & lane_mask)
+            aligned_end = align(end, match_group_size)
+            for base in T.serial(start, aligned_end, match_group_size):
+                if lane_idx < match_group_size:
+                    i = base + lane_idx
+                    expert_idx = T.Select(i < numel, T.int32(topk_idx_1d[i]), -1)
+                    lane_mask = T.uint32(1 << lane_idx) + T.uint32(1 << lane_idx) - 1
+                    lane_mask_rev = ~lane_mask
+                    mask = T.call_extern(T.uint32, '__match_any_sync', tilelang.tvm.tir.const(0xFFFFFFFF, T.uint32), expert_idx)
+                    count = T.popcount(mask & lane_mask)
 
-                if i < numel and expert_idx >= 0:
-                    T.assume(expert_idx < num_experts)
-                    prefix_count = experts_sum_per_warp_shared[warp_idx, expert_idx]
-                    pos = prefix_count - count
-                    if mask & lane_mask_rev == 0:
-                        experts_sum_per_warp_shared[warp_idx, expert_idx] = pos
-                    token_topk_to_pos_1d[i] = pos
-                    T.assume(0 <= pos < num_expanded_tokens)
-                    pos_to_expert[pos] = expert_idx
-                    pos_to_token[pos] = i // num_topk
-                    pos_to_token_topk[pos] = i
+                    if i < numel and expert_idx >= 0:
+                        T.assume(expert_idx < num_experts)
+                        prefix_count = experts_sum_per_warp_shared[warp_idx, expert_idx]
+                        pos = prefix_count - count
+                        if mask & lane_mask_rev == 0:
+                            experts_sum_per_warp_shared[warp_idx, expert_idx] = pos
+                        token_topk_to_pos_1d[i] = pos
+                        T.assume(0 <= pos < num_expanded_tokens)
+                        pos_to_expert[pos] = expert_idx
+                        pos_to_token[pos] = i // num_topk
+                        pos_to_token_topk[pos] = i
                 T.sync_warp()
 
     return get_fused_mapping_kernel

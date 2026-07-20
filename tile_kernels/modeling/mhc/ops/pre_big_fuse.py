@@ -1,7 +1,9 @@
 import torch
 
-from tile_kernels.mhc.norm_fn_kernel import _mhc_pre_norm_fn_fwd_mul, round_to_tf32
-from tile_kernels.mhc.pre_big_fuse_kernel import _mhc_pre_big_fuse
+from tile_kernels.modeling.mhc.ops.norm_fn import mhc_pre_norm_fn
+from tile_kernels.modeling.mhc.ops.pre_apply_mix import mhc_pre_apply_mix
+from tile_kernels.modeling.mhc.ops.pre_split_mixes import mhc_pre_split_mixes
+from tile_kernels.modeling.mhc.ops.sinkhorn import sinkhorn_normalize
 
 
 def mhc_pre_big_fuse(
@@ -32,60 +34,15 @@ def mhc_pre_big_fuse(
     assert mhc_scale.shape == (3,)
     assert mhc_base.shape == (mhc_mult3,)
 
-    outer_shape = residual.shape[:-2]
-
-    residual_flat = residual.view(-1, mhc_mult, hidden_size)
-    num_tokens = residual_flat.shape[0]
-    fn_flat = fn
-
-    post_mix = torch.empty(num_tokens, mhc_mult, dtype=torch.float32, device=residual.device)
-    comb_mix = torch.empty(num_tokens, mhc_mult2, dtype=torch.float32, device=residual.device)
-    layer_input = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device)
-
-    gemm_out_mul = torch.empty(
-        n_splits, num_tokens, mhc_mult3, dtype=torch.float32, device=residual.device
-    )
-    gemm_out_sqrsum = torch.empty(n_splits, num_tokens, dtype=torch.float32, device=residual.device)
-
-    # TileLang implementation doesn't support split-k, so we set n_splits to 1
-    # You may want to adopt the DeepGEMM implementation with split-k for better performance
-    n_splits = 1
-    gemm_out_mul = gemm_out_mul[:1]
-    gemm_out_sqrsum = gemm_out_sqrsum[:1]
-
-    fn = round_to_tf32(fn)
-
-    fwd_mul_kernel = _mhc_pre_norm_fn_fwd_mul(mhc_mult3, 1, mhc_hidden_size)
-    fwd_mul_kernel(
-        residual_flat.view(-1, mhc_hidden_size),
-        fn,
-        gemm_out_mul.view(-1, 1, mhc_mult3),
-        gemm_out_sqrsum.view(-1, 1),
-    )
-    # END of TileLang implementation of pre-norm-fn forward matmul
-
-    _mhc_pre_big_fuse(
-        hidden_size,
-        rms_eps,
-        mhc_pre_eps,
-        mhc_sinkhorn_eps,
-        mhc_post_mult_value,
-        sinkhorn_repeat,
-        n_splits=n_splits,
-        mhc_mult=mhc_mult,
-    )(
-        gemm_out_mul,
-        gemm_out_sqrsum,
+    mixes = mhc_pre_norm_fn(residual, fn, None, rms_eps, n_splits=n_splits)
+    pre_mix, post_mix, comb_mix = mhc_pre_split_mixes(
+        mixes,
         mhc_scale,
         mhc_base,
-        residual_flat,
-        post_mix,
-        comb_mix,
-        layer_input,
+        mhc_mult,
+        mhc_post_mult_value,
+        mhc_pre_eps,
     )
-
-    post_mix = post_mix.view(*outer_shape, mhc_mult, 1)
-    comb_mix = comb_mix.view(*outer_shape, mhc_mult, mhc_mult)
-    layer_input = layer_input.view(*outer_shape, hidden_size)
-
+    comb_mix = sinkhorn_normalize(comb_mix, repeat=sinkhorn_repeat, eps=mhc_sinkhorn_eps)
+    layer_input = mhc_pre_apply_mix(residual, pre_mix)
     return post_mix, comb_mix, layer_input

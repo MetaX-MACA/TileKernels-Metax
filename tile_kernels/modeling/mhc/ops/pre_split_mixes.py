@@ -36,13 +36,18 @@ class MHCPreSplitMixes(torch.autograd.Function):
             mhc_pre_eps,
             token_block_size=32,
         )
+        # C500 has 104 APs. For 128-multiple tile counts, use 128 persistent
+        # CTAs so every CTA owns the same number of tiles instead of a 104-AP tail.
+        persistent_ctas = get_num_sms()
+        if persistent_ctas == 104 and num_tokens % 128 == 0:
+            persistent_ctas = 128
         ctx.bwd_kernel = _mhc_pre_split_mixes_bwd(
             mhc_mult,
             mhc_post_mult_value,
             token_block_size=32,
-            num_sms=get_num_sms(),
+            num_sms=persistent_ctas,
         )
-        ctx.num_sms = get_num_sms()
+        ctx.num_sms = persistent_ctas
 
         ctx.fwd_kernel(input_mixes, mhc_scale, mhc_base, pre_layer_mix, post_layer_mix, comb_res_mix)
 

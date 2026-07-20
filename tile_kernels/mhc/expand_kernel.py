@@ -4,13 +4,15 @@ from tilelang import language as T
 
 
 @tilelang.jit
-def expand_to_mhc_fwd_tl(hidden: int, mhc_mult: int) -> tilelang.JITKernel:
+def expand_to_mhc_fwd_tl(
+    hidden: int,
+    mhc_mult: int,
+    blk_n: int = 32,
+    blk_h: int = 128,
+) -> tilelang.JITKernel:
     n = T.dynamic('num_tokens')
     h = hidden
     mhc = mhc_mult
-
-    blk_n = 32
-    blk_h = 128
 
     @T.prim_func
     def expand_to_mhc_fwd_kernel(

@@ -76,41 +76,18 @@ def _mhc_multilayer_recompute_kernel(
             post_mix_local = T.alloc_fragment(mhc, T.float32)
             comb_mix_local = T.alloc_fragment((mhc, mhc), T.float32)
 
-            layer_output_shared = T.alloc_shared((2, h_blk), T.bfloat16)
-            pre_mix_shared = T.alloc_shared((2, mhc), T.float32)
-            post_mix_shared = T.alloc_shared((2, mhc), T.float32)
-            comb_mix_shared = T.alloc_shared((2, mhc, mhc), T.float32)
-
             for i0_h in T.serial(h // h_blk):
                 T.copy(initial_residual[i_n, 0, i0_h * h_blk], res_local)
 
-                if L_post > 0:
-                    layer_output_tensor_0 = T.make_tensor(layer_output_ptrs[0], (n, h), T.bfloat16)
-                    pre_mix_tensor_0 = T.make_tensor(pre_mix_ptrs[0], (n, mhc), T.float32)
-                    post_mix_tensor_0 = T.make_tensor(post_mix_ptrs[0], (n, mhc), T.float32)
-                    comb_mix_tensor_0 = T.make_tensor(comb_mix_ptrs[0], (n, mhc, mhc), T.float32)
-                    T.copy(layer_output_tensor_0[i_n, i0_h * h_blk], layer_output_shared[0, :])
-                    T.copy(pre_mix_tensor_0[i_n, 0], pre_mix_shared[0, :])
-                    T.copy(post_mix_tensor_0[i_n, 0], post_mix_shared[0, :])
-                    T.copy(comb_mix_tensor_0[i_n, 0, 0], comb_mix_shared[0, :, :])
-
                 for i_layer in T.serial(L_post):
+                    layer_output_tensor = T.make_tensor(layer_output_ptrs[i_layer], (n, h), T.bfloat16)
+                    pre_mix_tensor = T.make_tensor(pre_mix_ptrs[i_layer], (n, mhc), T.float32)
+                    post_mix_tensor = T.make_tensor(post_mix_ptrs[i_layer], (n, mhc), T.float32)
+                    comb_mix_tensor = T.make_tensor(comb_mix_ptrs[i_layer], (n, mhc, mhc), T.float32)
                     layer_input_tensor = T.make_tensor(layer_input_ptrs[i_layer], (n, h), T.bfloat16)
                     output_residual_tensor = T.make_tensor(residual_ptrs[i_layer], (n, mhc, h), T.bfloat16)
 
-                    phase = i_layer % 2
-
-                    if i_layer + 1 < L_post:
-                        next_layer_output_tensor = T.make_tensor(layer_output_ptrs[i_layer + 1], (n, h), T.bfloat16)
-                        next_pre_mix_tensor = T.make_tensor(pre_mix_ptrs[i_layer + 1], (n, mhc), T.float32)
-                        next_post_mix_tensor = T.make_tensor(post_mix_ptrs[i_layer + 1], (n, mhc), T.float32)
-                        next_comb_mix_tensor = T.make_tensor(comb_mix_ptrs[i_layer + 1], (n, mhc, mhc), T.float32)
-                        T.copy(next_layer_output_tensor[i_n, i0_h * h_blk], layer_output_shared[1 - phase, :])
-                        T.copy(next_pre_mix_tensor[i_n, 0], pre_mix_shared[1 - phase, :])
-                        T.copy(next_post_mix_tensor[i_n, 0], post_mix_shared[1 - phase, :])
-                        T.copy(next_comb_mix_tensor[i_n, 0, 0], comb_mix_shared[1 - phase, :, :])
-
-                    T.copy(pre_mix_shared[phase, :], pre_mix_local)
+                    T.copy(pre_mix_tensor[i_n, 0], pre_mix_local)
 
                     T.clear(layer_input_local)
                     for i_mhc in T.serial(mhc):
@@ -119,9 +96,9 @@ def _mhc_multilayer_recompute_kernel(
 
                     T.copy(layer_input_local, layer_input_tensor[i_n, i0_h * h_blk])
 
-                    T.copy(post_mix_shared[phase, :], post_mix_local)
-                    T.copy(comb_mix_shared[phase, :, :], comb_mix_local)
-                    T.copy(layer_output_shared[phase, :], layer_output_local)
+                    T.copy(post_mix_tensor[i_n, 0], post_mix_local)
+                    T.copy(comb_mix_tensor[i_n, 0, 0], comb_mix_local)
+                    T.copy(layer_output_tensor[i_n, i0_h * h_blk], layer_output_local)
                     for i_mhco, i1_h in T.Parallel(mhc, h_blk):
                         new_res_local[i_mhco, i1_h] = post_mix_local[i_mhco] * layer_output_local[i1_h]
                         for i_mhci in T.serial(mhc):
@@ -181,7 +158,18 @@ def mhc_multilayer_recompute(
         device=initial_residual.device,
     )
 
-    kernel = _mhc_multilayer_recompute_kernel(mhc_mult, hidden, num_layers, num_post)
+    # Two Wave64 groups improve the 4096/7168 hidden shapes; 2560 and 8192 retain one.
+    n_thr = 128 if hidden in (4096, 7168) else 64
+    # 8192 needs smaller hidden tiles to avoid its large per-CTA fragment footprint.
+    h_blk = 512 if hidden == 8192 else 2048
+    kernel = _mhc_multilayer_recompute_kernel(
+        mhc_mult,
+        hidden,
+        num_layers,
+        num_post,
+        n_thr=n_thr,
+        h_blk=h_blk,
+    )
     kernel(
         initial_residual.view(-1, mhc_mult, hidden),
         pre_mix_ptrs,

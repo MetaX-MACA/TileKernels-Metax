@@ -33,6 +33,9 @@ class MHCHeadComputeMix(torch.autograd.Function):
         input_mix, mhc_scale, mhc_base = ctx.saved_tensors
 
         num_sms = get_num_sms()
+        num_tokens = input_mix.numel() // input_mix.shape[-1]
+        if num_sms == 104 and num_tokens % 128 == 0:
+            num_sms = 128
         input_mix_grad = torch.empty_like(input_mix)
         mhc_scale_grad_partial = torch.empty(
             num_sms,

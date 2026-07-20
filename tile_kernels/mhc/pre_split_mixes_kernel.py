@@ -72,7 +72,7 @@ def _mhc_pre_split_mixes_bwd(
     mhc_mult: int,
     mhc_post_mult_value: float,
     token_block_size: int,
-    num_sms: int = 148,
+    num_sms: int = 104,
     dtype: T.dtype = T.float32,
 ) -> tilelang.JITKernel:
     num_tokens = T.dynamic('num_tokens')

@@ -68,29 +68,35 @@ def _mhc_pre_norm_fn_fwd_mul(
     mhc_mult3: int,
     n_rms_group: int,
     rms_group_size: int,
-    token_block: int = 32,
-    hidden_block: int = 256,
+    token_block: int = 16,
+    hidden_block: int = 128,
+    use_bf16_mma: bool = False,
+    fn_is_bf16: bool = False,
 ) -> tilelang.JITKernel:
     assert mhc_mult3 <= 32
+    assert not fn_is_bf16 or use_bf16_mma
     num_tokens = T.dynamic('num_tokens')
     assert rms_group_size % hidden_block == 0
+    fn_dtype = T.bfloat16 if fn_is_bf16 else T.float32
 
     @T.prim_func
     def _mhc_pre_norm_fn_fwd_mul_kernel(
         x: T.Tensor[(num_tokens, n_rms_group * rms_group_size), T.bfloat16],
-        fn: T.Tensor[(mhc_mult3, n_rms_group * rms_group_size), T.float32],
+        fn: T.Tensor[(mhc_mult3, n_rms_group * rms_group_size), fn_dtype],
         out: T.Tensor[(num_tokens, n_rms_group, mhc_mult3), T.float32],
         sqrsum: T.Tensor[(num_tokens, n_rms_group), T.float32],
     ) -> None:
         _ = mhc_mult3
         with T.Kernel(T.ceildiv(num_tokens, token_block), n_rms_group) as (pid_x, pid_y):
             out_frag = T.alloc_fragment((token_block, 32), T.float32)
-            sqrsum_part = T.alloc_fragment((token_block, 4), T.float32)
+            sqrsum_part = T.alloc_fragment(token_block, T.float32)
             T.clear(out_frag)
             T.clear(sqrsum_part)
             for pz in T.Pipelined(rms_group_size // hidden_block, num_stages=1):
                 x_smem_16 = T.alloc_shared((token_block, hidden_block), T.bfloat16)
-                fn_smem = T.alloc_shared((32, hidden_block), T.float32)
+                fn_smem = T.alloc_shared(
+                    (32, hidden_block), T.bfloat16 if use_bf16_mma else T.float32
+                )
 
                 T.annotate_layout({x_smem_16: tilelang.layout.make_swizzled_layout(x_smem_16)})
 
@@ -102,27 +108,56 @@ def _mhc_pre_norm_fn_fwd_mul(
                 x_frag = T.alloc_fragment((token_block, hidden_block), T.float32)
                 T.copy(x_frag_16, x_frag)
 
-                for jj in T.serial(hidden_block // 4):
-                    for i, j in T.Parallel(token_block, 4):
-                        sqrsum_part[i, j] += x_frag[i, jj * 4 + j] * x_frag[i, jj * 4 + j]
+                # Compute sum of squares: first square each element, then reduce
+                x_sq = T.alloc_fragment((token_block, hidden_block), T.float32)
+                for i, j in T.Parallel(token_block, hidden_block):
+                    x_sq[i, j] = x_frag[i, j] * x_frag[i, j]
+                sqrsum_blk = T.alloc_fragment(token_block, T.float32)
+                T.reduce_sum(x_sq, sqrsum_blk)
+                for i in T.Parallel(token_block):
+                    sqrsum_part[i] += sqrsum_blk[i]
 
                 T.gemm(
-                    x_frag,
+                    x_frag_16 if use_bf16_mma else x_frag,
                     fn_smem,
                     out_frag,
                     transpose_A=False,
                     transpose_B=True,
                     clear_accum=False,
                 )
-            sqrsum_l = T.alloc_fragment(token_block, T.float32)
-            T.reduce_sum(sqrsum_part, sqrsum_l)
             for i in T.Parallel(token_block):
-                sqrsum[pid_x * token_block + i, pid_y] = sqrsum_l[i]
+                sqrsum[pid_x * token_block + i, pid_y] = sqrsum_part[i]
             for i, j in T.Parallel(token_block, 32):
                 if j < 24:
                     out[pid_x * token_block + i, pid_y, j] = out_frag[i, j]
 
     return _mhc_pre_norm_fn_fwd_mul_kernel
+
+
+@tilelang.jit(pass_configs=_PASS_CONFIGS)
+def _mhc_pre_norm_fn_fwd_sqsum(hidden: int, hidden_block: int = 128) -> tilelang.JITKernel:
+    num_tokens = T.dynamic('num_tokens')
+    assert hidden % hidden_block == 0
+
+    @T.prim_func
+    def _mhc_pre_norm_fn_fwd_sqsum_kernel(
+        x: T.Tensor[(num_tokens, hidden), T.bfloat16],
+        sqsum: T.Tensor[num_tokens, T.float32],
+    ) -> None:
+        with T.Kernel(num_tokens, threads=hidden_block) as pid:
+            sum_reducer = T.alloc_reducer(1, T.float32, replication='all')
+            T.clear(sum_reducer)
+            for i0_h in T.serial(hidden // hidden_block):
+                x_frag = T.alloc_fragment(hidden_block, T.bfloat16)
+                T.copy(x[pid, i0_h * hidden_block], x_frag)
+                for i1_h in T.Parallel(hidden_block):
+                    x_val = T.cast(x_frag[i1_h], T.float32)
+                    sum_reducer[0] += x_val * x_val
+            T.finalize_reducer(sum_reducer)
+            if T.get_thread_binding() == 0:
+                sqsum[pid] = sum_reducer[0]
+
+    return _mhc_pre_norm_fn_fwd_sqsum_kernel
 
 
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
@@ -212,8 +247,9 @@ def _mhc_pre_norm_fn_bwd_mul(
     mhc_mult3: int,
     n_rms_group: int,
     rms_group_size: int,
-    token_block: int = 128,
-    hidden_block: int = 64,
+    token_block: int = 64,
+    hidden_block: int = 32,
+    x_grad_is_zero: bool = False,
 ) -> tilelang.JITKernel:
     assert mhc_mult3 <= 32
     num_tokens = T.dynamic('num_tokens')
@@ -256,7 +292,10 @@ def _mhc_pre_norm_fn_bwd_mul(
                         padded_grad[i, j] = 0
 
                 x_grad_frag = T.alloc_fragment((token_block, hidden_block), T.float32)
-                T.copy(x_grad[px * token_block, yz], x_grad_frag)
+                if x_grad_is_zero:
+                    T.fill(x_grad_frag, 0)
+                else:
+                    T.copy(x_grad[px * token_block, yz], x_grad_frag)
 
                 T.gemm(
                     padded_grad,
